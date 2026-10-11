@@ -260,6 +260,7 @@ mod tests {
 			push_listener_addr: None,
 			push_listener_port: 443,
 			motion_wake_hold_secs: 30.0,
+			..Default::default()
 		});
 		cfg.webhook = Some(crate::config::WebhookConfig {
 			enable: true,

@@ -23,6 +23,7 @@ compiles this crate.
 | `adpcm_decode_block` | `bairelay_rtsp::transcode::adpcm::AdpcmDecoder::decode_block` | Camera ADPCM audio blocks. |
 | `webhook_http_request` | `neolink_core::fuzz_api::parse_http_request` | Webhook listener HTTP request framing and the request length it reports, LAN-exposed. |
 | `webhook_body` | `neolink_core::fuzz_api::{parse_webhook_body, alarm_events_from_xml}` | Webhook JSON body and forwarded cmd 33 XML. |
+| `dns_parse_a_response` | `bairelay::dns::parse_a_response` | Upstream resolver replies for push forwarding. |
 
 The `neolink_core` targets reach `pub(crate)` parsers via the
 `fuzz_api` module that the `fuzz-api` Cargo feature exposes. Production
