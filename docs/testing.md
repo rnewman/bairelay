@@ -376,8 +376,9 @@ broker_addr = "127.0.0.1"
 
 [mqtt.discovery]
 topic = "homeassistant"        # HA's own discovery prefix (required)
-# features = ["floodlight", "camera", "motion", "led", "ir",
-#             "reboot", "pt", "battery", "siren"]   # default: all 9
+# features = ["floodlight", "camera", "motion", "motion_class", "led",
+#             "ir", "reboot", "pt", "pt_preset", "battery", "siren",
+#             "pir"]   # default: all 12
 ```
 
 Per camera, bairelay publishes a single HA device named after the camera (underscores → spaces, title-cased: `front_door` → `Front Door`). Entities per feature:
@@ -387,6 +388,7 @@ Per camera, bairelay publishes a single HA device named after the camera (unders
 | Floodlight | `light` + `switch` (tasks)        | State payload JSON `{"state":"on"}`          |
 | Camera     | `camera`                          | Base64 JPEG preview from `status/preview`    |
 | Motion     | `binary_sensor`                   | `unique_id` suffix `_md`                     |
+| Motion class | 4 × `binary_sensor`             | Person / Vehicle / Animal / Other; suffix `_md_<class>` |
 | LED        | `switch`                          | Fire-and-forget; no state feedback           |
 | IR         | `select`                          | Options: on / off / auto                     |
 | Reboot     | `button`                          |                                              |

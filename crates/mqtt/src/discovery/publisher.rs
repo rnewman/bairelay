@@ -16,8 +16,8 @@ use crate::error::MqttError;
 
 use super::{
 	build_battery, build_camera, build_floodlight_light, build_floodlight_tasks_switch, build_ir,
-	build_led, build_motion, build_pir, build_pt_buttons, build_ptz_presets, build_reboot,
-	build_siren, CameraCapabilitiesView, DiscoveryContext, Feature,
+	build_led, build_motion, build_motion_classes, build_pir, build_pt_buttons, build_ptz_presets,
+	build_reboot, build_siren, CameraCapabilitiesView, DiscoveryContext, Feature,
 };
 
 /// Per-camera enable toggles. Mirrors the binary's per-camera
@@ -41,7 +41,7 @@ impl CameraEnableFlags {
 	/// gating and capability detection.
 	pub fn allows(&self, feature: Feature) -> bool {
 		match feature {
-			Feature::Motion => self.motion,
+			Feature::Motion | Feature::MotionClass => self.motion,
 			Feature::Battery => self.battery,
 			Feature::Floodlight => self.floodlight,
 			Feature::Led => self.light,
@@ -173,6 +173,9 @@ impl DiscoveryPublisher {
 					if let Some(p) = build_motion(&ctx) {
 						out.push(p);
 					}
+				}
+				Feature::MotionClass => {
+					out.extend(build_motion_classes(&ctx));
 				}
 				Feature::Led => {
 					if let Some(p) = build_led(&ctx) {
@@ -369,17 +372,18 @@ mod tests {
 	}
 
 	#[test]
-	fn compute_full_set_with_ptz_emits_14_topics() {
+	fn compute_full_set_with_ptz_emits_18_topics() {
 		let publisher = publisher_with_features(&Feature::ALL);
 		let caps = CameraCapabilitiesView { has_ptz: true };
 		let flags = all_flags_on();
 		let out =
 			publisher.compute_payloads("frontdoor", Some("10.0.0.1:9000"), None, caps, &flags, &[]);
-		// Floodlight → 2 (light + tasks switch), Pt → 4, and
-		// one each for Camera/Motion/Led/Ir/Reboot/Battery/Siren/Pir.
+		// Floodlight → 2 (light + tasks switch), Pt → 4,
+		// MotionClass → 4, and one each for
+		// Camera/Motion/Led/Ir/Reboot/Battery/Siren/Pir.
 		// PtPreset is suppressed because we pass `&[]` for presets.
-		// 2 + 4 + 8 = 14.
-		assert_eq!(out.len(), 14);
+		// 2 + 4 + 4 + 8 = 18.
+		assert_eq!(out.len(), 18);
 
 		// Every topic starts with the configured HA root.
 		for (topic, _) in &out {
@@ -400,7 +404,7 @@ mod tests {
 		let mut topics: Vec<String> = out.iter().map(|(t, _)| t.clone()).collect();
 		topics.sort();
 		topics.dedup();
-		assert_eq!(topics.len(), 14);
+		assert_eq!(topics.len(), 18);
 	}
 
 	#[test]
@@ -410,7 +414,7 @@ mod tests {
 		let flags = all_flags_on();
 		let out =
 			publisher.compute_payloads("frontdoor", Some("10.0.0.1:9000"), None, caps, &flags, &[]);
-		assert_eq!(out.len(), 10); // 14 − 4 PT buttons
+		assert_eq!(out.len(), 14); // 18 − 4 PT buttons
 		for (topic, _) in &out {
 			assert!(!topic.contains("/button/bairelay_frontdoor_pan_"));
 		}
@@ -432,7 +436,29 @@ mod tests {
 				"battery config was emitted despite enable_flags.battery = false: {topic}"
 			);
 		}
-		// Battery removed: 14 − 1.
+		// Battery removed: 18 − 1.
+		assert_eq!(out.len(), 17);
+	}
+
+	#[test]
+	fn compute_suppresses_motion_classes_when_motion_flag_off() {
+		// The per-class sensors are fed by the same motion listener
+		// as `md`, so `enable_motion = false` must drop them too.
+		let publisher = publisher_with_features(&Feature::ALL);
+		let caps = CameraCapabilitiesView { has_ptz: true };
+		let flags = CameraEnableFlags {
+			motion: false,
+			..all_flags_on()
+		};
+		let out =
+			publisher.compute_payloads("frontdoor", Some("10.0.0.1:9000"), None, caps, &flags, &[]);
+		for (topic, _) in &out {
+			assert!(
+				!topic.contains("bairelay_frontdoor_md"),
+				"motion config was emitted despite enable_flags.motion = false: {topic}"
+			);
+		}
+		// `md` + four classes removed: 18 − 5.
 		assert_eq!(out.len(), 13);
 	}
 
@@ -491,6 +517,7 @@ mod tests {
 		assert!(flags.allows(Feature::Siren));
 		// Gated features block when the flag is false.
 		assert!(!flags.allows(Feature::Motion));
+		assert!(!flags.allows(Feature::MotionClass));
 		assert!(!flags.allows(Feature::Battery));
 		assert!(!flags.allows(Feature::Floodlight));
 		assert!(!flags.allows(Feature::Led));
