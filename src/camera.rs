@@ -213,7 +213,7 @@ pub struct CameraHandle {
 	preview_state_tx: Arc<watch::Sender<PreviewState>>,
 	preview_state_rx: watch::Receiver<PreviewState>,
 	/// Per-camera cache of the most recently published MQTT status
-	/// values (battery, motion, motion classes, floodlight,
+	/// values (battery, motion, motion classes, push, floodlight,
 	/// floodlight_tasks, pir).
 	/// Threaded into every status-publishing task so each successful
 	/// publish updates the cache; read by `republish_cached_status`
@@ -228,8 +228,9 @@ pub struct CameraHandle {
 	/// the poller and re-run the same futile probes on every wake.
 	battery_unsupported: Arc<AtomicBool>,
 	/// Bumped by the push listener for every push from this camera. A
-	/// push's hold window only clears `motion` if no later push has
-	/// arrived, so back-to-back pushes don't cut each other short.
+	/// push's hold window only clears `motion` / `push` if no later
+	/// push has arrived, so back-to-back pushes don't cut each other
+	/// short.
 	push_seq: AtomicU64,
 	/// Global `Config::stream_prune_grace_secs` propagated by the
 	/// orchestrator at construction. Threaded through to
@@ -506,6 +507,9 @@ impl CameraHandle {
 		}
 		if let Some(detections) = self.status_cache.motion_classes() {
 			camera_tasks::publish_motion_classes(&publisher, detections).await?;
+		}
+		if let Some(push) = self.status_cache.push() {
+			publisher.publish_push(push).await?;
 		}
 		if let Some(on) = self.status_cache.floodlight() {
 			publisher.publish_floodlight(on).await?;
