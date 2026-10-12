@@ -448,7 +448,8 @@ By default the implementation drops the socket the instant `accept()` returns (w
    plus status/motion/{person,vehicle,animal,other} from the alarm's
    AItype — the first point at which the class is known.
    When motion ends -> MotionStatus::Stop -> publishes status/motion=off
-   and every class off.
+   and every class off, 500 ms later unless a Start arrives first (the
+   camera can send an AItype=none alarm just ahead of a classified one).
 
 9. After motion_wake_hold_secs, the push_listener's wake-lock guard
    drops + a fallback status/motion=off (and every class off) plus

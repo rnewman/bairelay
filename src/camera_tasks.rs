@@ -57,6 +57,27 @@ pub(crate) async fn publish_motion_classes(
 	Ok(())
 }
 
+/// How long a camera `Stop` waits before it's published. Woken by a
+/// push, cameras have been seen sending an `AItype` `none` alarm a
+/// millisecond ahead of the classified one, and again every few
+/// seconds while someone stays in frame; published as-is, each pair
+/// blinks HA's motion and class sensors off for 5–90 ms. A `Start`
+/// inside the window cancels the pending `Stop`.
+const MOTION_STOP_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Cap on the `motion=off` publish when the listener exits, so a
+/// wedged broker at shutdown can't hold the session task open.
+const EXIT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Publish `motion=off` and every class off, and cache both.
+async fn publish_motion_stop(publisher: &StatusPublisher<'_>, status_cache: &StatusCache) {
+	let _ = publisher.publish_motion(false).await;
+	status_cache.set_motion(false);
+	let none = AiDetections::default();
+	let _ = publish_motion_classes(publisher, none).await;
+	status_cache.set_motion_classes(none);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn motion_listener(
 	camera_name: String,
@@ -99,23 +120,43 @@ pub async fn motion_listener(
 		// "release N seconds from now" futures is at most one per
 		// listener at any time, regardless of motion-event flap rate.
 		let mut release_at: Option<tokio::time::Instant> = None;
+		// Pending `motion=off` publish: `Some(_)` while a Stop waits out
+		// `MOTION_STOP_DEBOUNCE`, cleared by the timer (publish) or a
+		// fresh Start (cancel).
+		let mut stop_at: Option<tokio::time::Instant> = None;
 
 		loop {
 			// `sleep_until` requires a concrete deadline. When no
-			// release is scheduled, point it 24 h out as a placeholder
-			// — the `if release_at.is_some()` guard disables that arm,
-			// so the placeholder is never actually reached.
-			let release_deadline = release_at
-				.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+			// timer is scheduled, point it 24 h out as a placeholder
+			// — the `if …is_some()` guards disable those arms, so the
+			// placeholder is never actually reached.
+			let placeholder = || tokio::time::Instant::now() + Duration::from_secs(86_400);
+			let release_deadline = release_at.unwrap_or_else(placeholder);
+			let stop_deadline = stop_at.unwrap_or_else(placeholder);
 
 			tokio::select! {
-				_ = cancel.cancelled() => return,
+				_ = cancel.cancelled() => {
+					// A Stop still inside its debounce window would be
+					// lost with the session, leaving HA stuck on `on`.
+					if stop_at.is_some() {
+						let _ = tokio::time::timeout(
+							EXIT_PUBLISH_TIMEOUT,
+							publish_motion_stop(&publisher, &status_cache),
+						)
+						.await;
+					}
+					return;
+				}
 				_ = tokio::time::sleep_until(release_deadline), if release_at.is_some() => {
 					// Hold-down expired with no new motion — drop the
 					// wake-lock guard so the camera becomes eligible
 					// for idle disconnect.
 					wake_guard = None;
 					release_at = None;
+				}
+				_ = tokio::time::sleep_until(stop_deadline), if stop_at.is_some() => {
+					stop_at = None;
+					publish_motion_stop(&publisher, &status_cache).await;
 				}
 				result = motion_data.next_motion() => {
 					match result {
@@ -125,11 +166,13 @@ pub async fn motion_listener(
 								classes = %detected_class_names(detections),
 								"Motion detected"
 							);
-							// New motion cancels any pending release;
-							// re-acquire only if we don't already hold
-							// one (a back-to-back Start without an
-							// intervening Stop is rare but harmless).
+							// New motion cancels any pending release and
+							// any pending off; re-acquire only if we
+							// don't already hold one (a back-to-back
+							// Start without an intervening Stop is rare
+							// but harmless).
 							release_at = None;
+							stop_at = None;
 							if wake_guard.is_none() {
 								wake_guard = Some(wake_lock.acquire());
 							}
@@ -140,11 +183,7 @@ pub async fn motion_listener(
 						}
 						Ok(MotionStatus::Stop(_)) => {
 							tracing::info!(camera = %camera_name, "Motion stopped");
-							let _ = publisher.publish_motion(false).await;
-							status_cache.set_motion(false);
-							let none = AiDetections::default();
-							let _ = publish_motion_classes(&publisher, none).await;
-							status_cache.set_motion_classes(none);
+							stop_at = Some(tokio::time::Instant::now() + MOTION_STOP_DEBOUNCE);
 							if wake_guard.is_some() {
 								release_at = Some(
 									tokio::time::Instant::now() + motion_wake_hold,
@@ -154,6 +193,11 @@ pub async fn motion_listener(
 						Ok(MotionStatus::NoChange(_)) => {}
 						Err(e) => {
 							tracing::warn!(camera = %camera_name, error = %e, "Motion listener error");
+							// Re-subscribing starts from scratch; don't
+							// drop a Stop the camera already sent.
+							if stop_at.take().is_some() {
+								publish_motion_stop(&publisher, &status_cache).await;
+							}
 							break;
 						}
 					}
@@ -746,6 +790,127 @@ mod tests {
 
 		cancel.cancel();
 		let _ = task.await;
+	}
+
+	type MotionItem = std::result::Result<MotionStatus, bairelay_neolink_core::bc_protocol::Error>;
+
+	/// Spawn a `motion_listener` fed from the returned sender.
+	fn spawn_motion_listener(
+		cancel: &CancellationToken,
+	) -> (
+		tokio::sync::mpsc::Sender<MotionItem>,
+		MockHandle,
+		Arc<StatusCache>,
+		tokio::task::JoinHandle<()>,
+	) {
+		let (motion_tx, motion_rx) = tokio::sync::mpsc::channel::<MotionItem>(8);
+		let motion_data = bairelay_neolink_core::bc_protocol::MotionData::test_new(motion_rx);
+		let fake = FakeCameraBuilder::new()
+			.with_motion_stream(motion_data)
+			.build();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cache = empty_cache();
+		let task = tokio::spawn(motion_listener(
+			"cam1".to_string(),
+			fake,
+			mqtt,
+			"bairelay".to_string(),
+			crate::wake_lock::WakeLockCounter::new(),
+			cancel.clone(),
+			Duration::from_secs(30),
+			Arc::clone(&cache),
+		));
+		(motion_tx, mock, cache, task)
+	}
+
+	fn motion_payloads(mock: &MockHandle) -> Vec<Vec<u8>> {
+		mock.published()
+			.into_iter()
+			.filter(|(t, _, _)| t == "bairelay/cam1/status/motion")
+			.map(|(_, p, _)| p)
+			.collect()
+	}
+
+	/// A Stop is held for `MOTION_STOP_DEBOUNCE`; a Start inside that
+	/// window cancels it, so the camera's `none`-then-class pair never
+	/// reaches HA as an off blip. A lone Stop still lands.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn motion_listener_debounces_stop() {
+		let cancel = CancellationToken::new();
+		let (tx, mock, cache, task) = spawn_motion_listener(&cancel);
+		let person = AiDetections {
+			person: true,
+			..Default::default()
+		};
+		let now = std::time::Instant::now;
+
+		tx.send(Ok(MotionStatus::Start(now(), person)))
+			.await
+			.unwrap();
+		assert!(
+			await_publish_matching(&mock, Duration::from_secs(2), |(t, p, _)| {
+				t == "bairelay/cam1/status/motion" && p == b"on"
+			})
+			.await
+		);
+
+		tx.send(Ok(MotionStatus::Stop(now()))).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		tx.send(Ok(MotionStatus::Start(now(), person)))
+			.await
+			.unwrap();
+		tokio::time::sleep(MOTION_STOP_DEBOUNCE + Duration::from_millis(200)).await;
+		assert_eq!(
+			motion_payloads(&mock),
+			[b"on".to_vec(), b"on".to_vec()],
+			"a Start inside the window cancels the pending off"
+		);
+		assert_eq!(cache.motion(), Some(true));
+
+		tx.send(Ok(MotionStatus::Stop(now()))).await.unwrap();
+		assert!(
+			await_publish_matching(&mock, Duration::from_secs(2), |(t, p, _)| {
+				t == "bairelay/cam1/status/motion" && p == b"off"
+			})
+			.await,
+			"a lone Stop publishes once the window passes"
+		);
+		assert_eq!(cache.motion(), Some(false));
+		assert_eq!(cache.motion_classes(), Some(AiDetections::default()));
+
+		cancel.cancel();
+		let _ = task.await;
+	}
+
+	/// A session ending while a Stop waits out its debounce still
+	/// publishes the off, rather than leaving HA on `on`.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn motion_listener_flushes_pending_stop_on_cancel() {
+		let cancel = CancellationToken::new();
+		let (tx, mock, cache, task) = spawn_motion_listener(&cancel);
+		let now = std::time::Instant::now;
+
+		tx.send(Ok(MotionStatus::Start(now(), AiDetections::default())))
+			.await
+			.unwrap();
+		// `next_motion` coalesces queued events, so let the Start land
+		// before sending the Stop.
+		assert!(
+			await_publish_matching(&mock, Duration::from_secs(2), |(t, p, _)| {
+				t == "bairelay/cam1/status/motion" && p == b"on"
+			})
+			.await
+		);
+		tx.send(Ok(MotionStatus::Stop(now()))).await.unwrap();
+		// Long enough for the listener to take the Stop, well inside
+		// the debounce window.
+		tokio::time::sleep(Duration::from_millis(100)).await;
+		assert_eq!(motion_payloads(&mock), [b"on".to_vec()]);
+
+		cancel.cancel();
+		let _ = task.await;
+		assert_eq!(motion_payloads(&mock), [b"on".to_vec(), b"off".to_vec()]);
+		assert_eq!(cache.motion(), Some(false));
 	}
 
 	#[test]
