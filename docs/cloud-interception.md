@@ -448,21 +448,25 @@ By default the implementation drops the socket the instant `accept()` returns (w
    plus status/motion/{person,vehicle,animal,other} from the alarm's
    AItype — the first point at which the class is known.
    When motion ends -> MotionStatus::Stop -> publishes status/motion=off
-   and every class off.
+   and every class off, 500 ms later unless a Start arrives first (the
+   camera can send an AItype=none alarm just ahead of a classified one).
 
 9. After motion_wake_hold_secs, the push_listener's wake-lock guard
-   drops + a fallback status/motion=off (and every class off) plus
-   status/push=off is published — unless a later push from the same
-   camera arrived meanwhile, in which case that push's timer clears. This catches the case where step 7 fails (e.g. the
-   camera went back to sleep before bairelay reconnected) so HA never
-   gets stuck on motion=on.
+   drops + status/push=off is published, with a fallback
+   status/motion=off (and every class off) — unless a later push from
+   the same camera arrived meanwhile, in which case that push's timer
+   clears. The motion half is skipped while step 8's session is
+   reporting an alarm it hasn't seen stop; the session clears it, on
+   its Stop or when it disconnects. This catches the case where step 7
+   fails (e.g. the camera went back to sleep before bairelay
+   reconnected) so HA never gets stuck on motion=on.
 
 10. With no other wake-lock holders, the camera goes idle, the
     watchdog disconnects it, the camera resumes its sleep-mode
     heartbeats.
 ```
 
-The fallback `motion=off` in step 9 can race with step 8's live `motion=off` in either order; HA dedups. If motion is *still* ongoing when the fallback fires (rare on Argus — most events are sub-30 s bursts), HA sees a brief `off` flicker before the in-session listener's next Stop. Acceptable trade-off — an occasional flicker beats an indefinitely stuck `on`.
+The fallback `motion=off` in step 9 can race with step 8's live `motion=off` in either order; HA dedups. If motion is *still* ongoing when the fallback fires, the session has reported its Start and not its Stop, so the fallback leaves `motion` and the classes on rather than clearing a live alarm; the session's Stop (or its exit, if it drops) clears them.
 
 ## II.5 Operator deployment
 
