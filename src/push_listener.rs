@@ -32,7 +32,10 @@
 //! Baichuan session is up, the existing `motion_listener` subscribes
 //! and publishes the eventual `motion=off` from the camera itself.
 //! We publish a fallback `motion=off` after `motion_wake_hold_secs` so
-//! HA never gets stuck on "motion=on" if reconnect failed.
+//! HA never gets stuck on "motion=on" if reconnect failed. Once the
+//! session has reported the alarm it owns `motion`, and the fallback
+//! leaves it be: the session's Stop, or its exit, clears it instead,
+//! so an alarm outlasting the hold isn't blanked mid-way.
 //!
 //! Each push also drives `status/push`, which in-session motion never
 //! touches: it's the camera's own alarm decision (its detection and
@@ -42,7 +45,7 @@
 //! lives in the TLS body we can't read. The per-class
 //! `status/motion/{class}` topics are only published once the
 //! reconnected session's `motion_listener` sees the camera's
-//! `AlarmEvent`; the fallback clears them alongside `motion`.
+//! `AlarmEvent`; the fallback clears them whenever it clears `motion`.
 //!
 //! **Threat model — source-IP trust.** A peer IP that resolves through
 //! the wake-server registry or a configured address is treated as
@@ -425,12 +428,14 @@ async fn reset_push_state(
 }
 
 /// Fire the motion event: publish `status/motion=on` and
-/// `status/push=on`, hold a wake-lock for `hold`, then publish a
-/// fallback `motion=off` (every per-class topic too) and `push=off` so
-/// HA never gets stuck on `on` if the in-session `motion_listener`
-/// never picks up the live `Stop`. Idempotent w.r.t. the in-session
-/// publisher — duplicate `off` is harmless (HA dedups). `seq` is this
-/// push's [`CameraHandle::push_seq`]; a later push takes over the clear.
+/// `status/push=on`, hold a wake-lock for `hold`, then publish
+/// `push=off` and a fallback `motion=off` (every per-class topic too)
+/// so HA never gets stuck on `on` if the in-session `motion_listener`
+/// never picks up the live `Stop`. The motion half is skipped while
+/// the session is reporting the alarm ([`CameraHandle::session_alarm`]);
+/// it clears that itself. Idempotent w.r.t. the in-session publisher
+/// — duplicate `off` is harmless (HA dedups). `seq` is this push's
+/// [`CameraHandle::push_seq`]; a later push takes over the clear.
 async fn fire_motion(
 	handle: Arc<CameraHandle>,
 	mqtt: SharedMqttClient,
@@ -466,15 +471,23 @@ async fn fire_motion(
 	// dead broker hits the timeout and we move on quietly.
 	const FALLBACK_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 	let none = AiDetections::default();
+	// Someone still in frame past the hold: the session saw the alarm
+	// start and will publish its end, so clearing here would blank a
+	// live alarm.
+	let clear_motion = !handle.session_alarm().load(Ordering::SeqCst);
 	let clear = async {
-		publisher.publish_motion(false).await?;
-		crate::camera_tasks::publish_motion_classes(&publisher, none).await?;
+		if clear_motion {
+			publisher.publish_motion(false).await?;
+			crate::camera_tasks::publish_motion_classes(&publisher, none).await?;
+		}
 		publisher.publish_push(false).await
 	};
 	match tokio::time::timeout(FALLBACK_PUBLISH_TIMEOUT, clear).await {
 		Ok(Ok(())) => {
-			handle.status_cache().set_motion(false);
-			handle.status_cache().set_motion_classes(none);
+			if clear_motion {
+				handle.status_cache().set_motion(false);
+				handle.status_cache().set_motion_classes(none);
+			}
 			handle.status_cache().set_push(false);
 		}
 		Ok(Err(e)) => {
@@ -1102,6 +1115,74 @@ mod tests {
 				b"off".to_vec()
 			]
 		);
+
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+	}
+
+	#[tokio::test]
+	async fn fallback_leaves_an_alarm_the_session_reported() {
+		// Someone still in frame when the hold ends: the session saw the
+		// alarm start, so only push clears; motion and the classes wait
+		// for the session's own Stop.
+		let registry = bairelay_wake_server::make_registry();
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		let handle = handle_with_address("yard", Some("127.0.0.1"));
+		handle.session_alarm().store(true, Ordering::SeqCst);
+		cameras.insert("yard".into(), Arc::clone(&handle));
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let cfg = RuntimeConfig {
+			bind_addr: "127.0.0.1".parse().unwrap(),
+			bind_port: port,
+			motion_wake_hold: Duration::from_millis(200),
+			stale_after: Duration::from_secs(80),
+			forward: None,
+		};
+		let server = tokio::spawn(run_with_listener(
+			listener,
+			cfg,
+			registry,
+			Arc::new(cameras),
+			Some(mqtt),
+			"bairelay".into(),
+			cancel.clone(),
+		));
+
+		let payloads = |mock: &bairelay_mqtt::test_support::MockHandle, topic: &str| {
+			mock.published()
+				.into_iter()
+				.filter(|(t, _, _)| t == topic)
+				.map(|(_, p, _)| p)
+				.collect::<Vec<_>>()
+		};
+		let _push = tokio::net::TcpStream::connect(("127.0.0.1", port))
+			.await
+			.unwrap();
+		// Listener-start reset, the push, then the hold's clear.
+		let cleared = tokio::time::timeout(Duration::from_secs(2), async {
+			while payloads(&mock, "bairelay/yard/status/push").len() < 3 {
+				tokio::time::sleep(Duration::from_millis(10)).await;
+			}
+		})
+		.await;
+		assert!(cleared.is_ok(), "push clears at the end of the hold");
+
+		assert_eq!(
+			payloads(&mock, "bairelay/yard/status/motion"),
+			[b"on".to_vec()]
+		);
+		assert!(
+			!mock
+				.published()
+				.iter()
+				.any(|(t, _, _)| t.starts_with("bairelay/yard/status/motion/")),
+			"class topics are the session's to clear"
+		);
+		assert_eq!(handle.status_cache().motion(), Some(true));
+		assert_eq!(handle.status_cache().push(), Some(false));
 
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

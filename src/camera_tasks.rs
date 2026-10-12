@@ -69,15 +69,24 @@ const MOTION_STOP_DEBOUNCE: Duration = Duration::from_millis(500);
 /// wedged broker at shutdown can't hold the session task open.
 const EXIT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Publish `motion=off` and every class off, and cache both.
-async fn publish_motion_stop(publisher: &StatusPublisher<'_>, status_cache: &StatusCache) {
+/// Publish `motion=off` and every class off, cache both, and hand the
+/// topics back to the push listener's fallback.
+async fn publish_motion_stop(
+	publisher: &StatusPublisher<'_>,
+	status_cache: &StatusCache,
+	session_alarm: &AtomicBool,
+) {
 	let _ = publisher.publish_motion(false).await;
 	status_cache.set_motion(false);
 	let none = AiDetections::default();
 	let _ = publish_motion_classes(publisher, none).await;
 	status_cache.set_motion_classes(none);
+	session_alarm.store(false, Ordering::SeqCst);
 }
 
+/// `session_alarm` is set from a Start until its published Stop (see
+/// `CameraHandle`'s field of the same name). An alarm still open when
+/// the listener exits is cleared then, since nothing else will.
 #[allow(clippy::too_many_arguments)]
 pub async fn motion_listener(
 	camera_name: String,
@@ -88,6 +97,7 @@ pub async fn motion_listener(
 	cancel: CancellationToken,
 	motion_wake_hold: Duration,
 	status_cache: Arc<StatusCache>,
+	session_alarm: Arc<AtomicBool>,
 ) {
 	let publisher = StatusPublisher::new(&mqtt, &topic_prefix, &camera_name);
 	// Sustained network flap with N cameras × M retries/min produces a
@@ -97,7 +107,7 @@ pub async fn motion_listener(
 	// doesn't permanently inflate the retry interval.
 	let mut backoff = ReconnectBackoff::new(Duration::from_secs(1), Duration::from_secs(60));
 
-	loop {
+	'subscribe: loop {
 		let mut motion_data = match bc_camera.listen_on_motion().await {
 			Ok(md) => md,
 			Err(e) => {
@@ -135,18 +145,7 @@ pub async fn motion_listener(
 			let stop_deadline = stop_at.unwrap_or_else(placeholder);
 
 			tokio::select! {
-				_ = cancel.cancelled() => {
-					// A Stop still inside its debounce window would be
-					// lost with the session, leaving HA stuck on `on`.
-					if stop_at.is_some() {
-						let _ = tokio::time::timeout(
-							EXIT_PUBLISH_TIMEOUT,
-							publish_motion_stop(&publisher, &status_cache),
-						)
-						.await;
-					}
-					return;
-				}
+				_ = cancel.cancelled() => break 'subscribe,
 				_ = tokio::time::sleep_until(release_deadline), if release_at.is_some() => {
 					// Hold-down expired with no new motion — drop the
 					// wake-lock guard so the camera becomes eligible
@@ -156,7 +155,7 @@ pub async fn motion_listener(
 				}
 				_ = tokio::time::sleep_until(stop_deadline), if stop_at.is_some() => {
 					stop_at = None;
-					publish_motion_stop(&publisher, &status_cache).await;
+					publish_motion_stop(&publisher, &status_cache, &session_alarm).await;
 				}
 				result = motion_data.next_motion() => {
 					match result {
@@ -176,6 +175,7 @@ pub async fn motion_listener(
 							if wake_guard.is_none() {
 								wake_guard = Some(wake_lock.acquire());
 							}
+							session_alarm.store(true, Ordering::SeqCst);
 							let _ = publisher.publish_motion(true).await;
 							status_cache.set_motion(true);
 							let _ = publish_motion_classes(&publisher, detections).await;
@@ -194,9 +194,11 @@ pub async fn motion_listener(
 						Err(e) => {
 							tracing::warn!(camera = %camera_name, error = %e, "Motion listener error");
 							// Re-subscribing starts from scratch; don't
-							// drop a Stop the camera already sent.
+							// drop a Stop the camera already sent. An
+							// alarm still running stays open: the
+							// re-subscribed listener sees its Stop.
 							if stop_at.take().is_some() {
-								publish_motion_stop(&publisher, &status_cache).await;
+								publish_motion_stop(&publisher, &status_cache, &session_alarm).await;
 							}
 							break;
 						}
@@ -211,6 +213,19 @@ pub async fn motion_listener(
 		if !backoff.sleep_with_cancel(&cancel).await {
 			break;
 		}
+	}
+
+	// The session is over, so nothing will report this alarm's end
+	// (a Stop waiting out its debounce included). Clear it rather
+	// than leave HA stuck on `on`; bounded, as the broker may be going
+	// away too at shutdown. Swapped first so a timed-out publish
+	// can't leave the next session's fallback locked out.
+	if session_alarm.swap(false, Ordering::SeqCst) {
+		let _ = tokio::time::timeout(
+			EXIT_PUBLISH_TIMEOUT,
+			publish_motion_stop(&publisher, &status_cache, &session_alarm),
+		)
+		.await;
 	}
 }
 
@@ -654,6 +669,7 @@ mod tests {
 			cancel.clone(),
 			Duration::from_secs(30),
 			empty_cache(),
+			Arc::new(AtomicBool::new(false)),
 		));
 
 		// Push a Start event and wait briefly for the publish to
@@ -708,6 +724,7 @@ mod tests {
 			cancel.clone(),
 			Duration::from_secs(30),
 			Arc::clone(&cache),
+			Arc::new(AtomicBool::new(false)),
 		));
 
 		let class_states = |mock: &MockHandle| -> Vec<(String, String)> {
@@ -801,6 +818,7 @@ mod tests {
 		tokio::sync::mpsc::Sender<MotionItem>,
 		MockHandle,
 		Arc<StatusCache>,
+		Arc<AtomicBool>,
 		tokio::task::JoinHandle<()>,
 	) {
 		let (motion_tx, motion_rx) = tokio::sync::mpsc::channel::<MotionItem>(8);
@@ -810,6 +828,7 @@ mod tests {
 			.build();
 		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
 		let cache = empty_cache();
+		let alarm = Arc::new(AtomicBool::new(false));
 		let task = tokio::spawn(motion_listener(
 			"cam1".to_string(),
 			fake,
@@ -819,8 +838,9 @@ mod tests {
 			cancel.clone(),
 			Duration::from_secs(30),
 			Arc::clone(&cache),
+			Arc::clone(&alarm),
 		));
-		(motion_tx, mock, cache, task)
+		(motion_tx, mock, cache, alarm, task)
 	}
 
 	fn motion_payloads(mock: &MockHandle) -> Vec<Vec<u8>> {
@@ -837,7 +857,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn motion_listener_debounces_stop() {
 		let cancel = CancellationToken::new();
-		let (tx, mock, cache, task) = spawn_motion_listener(&cancel);
+		let (tx, mock, cache, alarm, task) = spawn_motion_listener(&cancel);
 		let person = AiDetections {
 			person: true,
 			..Default::default()
@@ -866,6 +886,7 @@ mod tests {
 			"a Start inside the window cancels the pending off"
 		);
 		assert_eq!(cache.motion(), Some(true));
+		assert!(alarm.load(Ordering::SeqCst), "still the session's alarm");
 
 		tx.send(Ok(MotionStatus::Stop(now()))).await.unwrap();
 		assert!(
@@ -877,6 +898,7 @@ mod tests {
 		);
 		assert_eq!(cache.motion(), Some(false));
 		assert_eq!(cache.motion_classes(), Some(AiDetections::default()));
+		assert!(!alarm.load(Ordering::SeqCst), "published Stop ends it");
 
 		cancel.cancel();
 		let _ = task.await;
@@ -887,7 +909,7 @@ mod tests {
 	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 	async fn motion_listener_flushes_pending_stop_on_cancel() {
 		let cancel = CancellationToken::new();
-		let (tx, mock, cache, task) = spawn_motion_listener(&cancel);
+		let (tx, mock, cache, _alarm, task) = spawn_motion_listener(&cancel);
 		let now = std::time::Instant::now;
 
 		tx.send(Ok(MotionStatus::Start(now(), AiDetections::default())))
@@ -911,6 +933,35 @@ mod tests {
 		let _ = task.await;
 		assert_eq!(motion_payloads(&mock), [b"on".to_vec(), b"off".to_vec()]);
 		assert_eq!(cache.motion(), Some(false));
+	}
+
+	/// The push fallback leaves a session's alarm alone, so the
+	/// session clears one it never saw end when it goes away.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn motion_listener_clears_open_alarm_when_session_ends() {
+		let cancel = CancellationToken::new();
+		let (tx, mock, cache, alarm, task) = spawn_motion_listener(&cancel);
+		let person = AiDetections {
+			person: true,
+			..Default::default()
+		};
+
+		tx.send(Ok(MotionStatus::Start(std::time::Instant::now(), person)))
+			.await
+			.unwrap();
+		assert!(
+			await_publish_matching(&mock, Duration::from_secs(2), |(t, p, _)| {
+				t == "bairelay/cam1/status/motion/person" && p == b"on"
+			})
+			.await
+		);
+		assert!(alarm.load(Ordering::SeqCst));
+
+		cancel.cancel();
+		let _ = task.await;
+		assert_eq!(motion_payloads(&mock), [b"on".to_vec(), b"off".to_vec()]);
+		assert_eq!(cache.motion_classes(), Some(AiDetections::default()));
+		assert!(!alarm.load(Ordering::SeqCst));
 	}
 
 	#[test]
@@ -1576,6 +1627,7 @@ mod tests {
 			cancel.clone(),
 			Duration::from_secs(30),
 			empty_cache(),
+			Arc::new(AtomicBool::new(false)),
 		));
 
 		// Start then Stop in quick succession.
@@ -1637,6 +1689,7 @@ mod tests {
 			cancel.clone(),
 			hold,
 			empty_cache(),
+			Arc::new(AtomicBool::new(false)),
 		));
 
 		// Start → wake lock acquired.
@@ -1708,6 +1761,7 @@ mod tests {
 			cancel.clone(),
 			hold,
 			empty_cache(),
+			Arc::new(AtomicBool::new(false)),
 		));
 
 		// Start → Stop → Start, all within the hold-down window.
@@ -1776,6 +1830,7 @@ mod tests {
 			cancel.clone(),
 			Duration::from_secs(30),
 			empty_cache(),
+			Arc::new(AtomicBool::new(false)),
 		));
 
 		motion_tx
@@ -1835,6 +1890,7 @@ mod tests {
 			cancel.clone(),
 			Duration::from_secs(30),
 			empty_cache(),
+			Arc::new(AtomicBool::new(false)),
 		));
 
 		// Push one Err into the motion channel. The listener will log
@@ -2129,6 +2185,7 @@ mod tests {
 			cancel.clone(),
 			Duration::from_secs(30),
 			empty_cache(),
+			Arc::new(AtomicBool::new(false)),
 		));
 
 		// Give the listener enough wall time to invoke
