@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{watch, Notify};
@@ -226,6 +226,10 @@ pub struct CameraHandle {
 	/// `spawn_session_tasks` consults it so a reconnect doesn't restart
 	/// the poller and re-run the same futile probes on every wake.
 	battery_unsupported: Arc<AtomicBool>,
+	/// Bumped by the push listener for every push from this camera. A
+	/// push's hold window only clears `motion` if no later push has
+	/// arrived, so back-to-back pushes don't cut each other short.
+	push_seq: AtomicU64,
 	/// Global `Config::stream_prune_grace_secs` propagated by the
 	/// orchestrator at construction. Threaded through to
 	/// [`crate::config::resolve_idle_disconnect_timeout`] so the floor
@@ -303,6 +307,7 @@ impl CameraHandle {
 			preview_state_rx,
 			status_cache: Arc::new(StatusCache::default()),
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
+			push_seq: AtomicU64::new(0),
 			prune_grace: Duration::ZERO,
 		}
 	}
@@ -471,6 +476,10 @@ impl CameraHandle {
 	/// `true` once `battery_poller` has concluded this camera has no
 	/// battery hardware and given up. Sticky for the process lifetime;
 	/// gates the poller respawn in [`Self::spawn_session_tasks`].
+	pub fn push_seq(&self) -> &AtomicU64 {
+		&self.push_seq
+	}
+
 	pub fn battery_unsupported(&self) -> bool {
 		self.battery_unsupported.load(Ordering::Acquire)
 	}
