@@ -236,6 +236,11 @@ pub struct CameraHandle {
 	/// push has arrived, so back-to-back pushes don't cut each other
 	/// short.
 	push_seq: AtomicU64,
+	/// `true` from the in-session `motion_listener`'s Start until its
+	/// published Stop, or until the session ends. While set, the
+	/// session owns `motion` and the class topics, and the push
+	/// listener's hold-window fallback leaves them alone.
+	session_alarm: Arc<AtomicBool>,
 	/// Global `Config::stream_prune_grace_secs` propagated by the
 	/// orchestrator at construction. Threaded through to
 	/// [`crate::config::resolve_idle_disconnect_timeout`] so the floor
@@ -315,6 +320,7 @@ impl CameraHandle {
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
 			led_write_lock: tokio::sync::Mutex::new(()),
 			push_seq: AtomicU64::new(0),
+			session_alarm: Arc::new(AtomicBool::new(false)),
 			prune_grace: Duration::ZERO,
 		}
 	}
@@ -488,6 +494,12 @@ impl CameraHandle {
 	/// Push counter the push listener bumps; see the `push_seq` field.
 	pub fn push_seq(&self) -> &AtomicU64 {
 		&self.push_seq
+	}
+
+	/// Whether the in-session motion listener is reporting an alarm.
+	/// See the `session_alarm` field.
+	pub fn session_alarm(&self) -> Arc<AtomicBool> {
+		Arc::clone(&self.session_alarm)
 	}
 
 	/// `true` once `battery_poller` has concluded this camera has no
@@ -1113,6 +1125,7 @@ impl CameraHandle {
 					session_cancel.clone(),
 					Duration::from_secs_f64(self.config.motion_wake_hold_secs),
 					self.status_cache(),
+					self.session_alarm(),
 				));
 			}
 			// `battery_unsupported` latches when the poller concludes the
