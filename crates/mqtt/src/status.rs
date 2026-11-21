@@ -60,6 +60,16 @@ impl<'a> StatusPublisher<'a> {
 			.await
 	}
 
+	/// Publish whether a camera push (its own alarm notification, as
+	/// seen by the push listener) is within its hold window (retained).
+	pub async fn publish_push(&self, active: bool) -> Result<(), MqttError> {
+		let payload = if active { "on" } else { "off" };
+		let topic = topics::status_push(&self.topic_prefix, &self.camera_name);
+		self.client
+			.publish_retained(&topic, payload.as_bytes())
+			.await
+	}
+
 	/// Publish the detection state of one AI object class (retained).
 	pub async fn publish_ai_object(
 		&self,
@@ -229,6 +239,27 @@ mod tests {
 				false
 			)]
 		);
+	}
+
+	#[tokio::test]
+	async fn publish_push_both_states() {
+		let (client, mock) = crate::test_support::mock_client();
+		let pub_ = StatusPublisher::new(&client, "bairelay", "cam1");
+		pub_.publish_push(true).await.unwrap();
+		pub_.publish_push(false).await.unwrap();
+		let expected = [
+			(
+				"bairelay/cam1/status/push".to_string(),
+				b"on".to_vec(),
+				true,
+			),
+			(
+				"bairelay/cam1/status/push".to_string(),
+				b"off".to_vec(),
+				true,
+			),
+		];
+		assert_eq!(mock.published(), expected);
 	}
 
 	#[tokio::test]

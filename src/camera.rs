@@ -215,7 +215,7 @@ pub struct CameraHandle {
 	preview_state_tx: Arc<watch::Sender<PreviewState>>,
 	preview_state_rx: watch::Receiver<PreviewState>,
 	/// Per-camera cache of the most recently published MQTT status
-	/// values (battery, motion, floodlight, floodlight_tasks, pir).
+	/// values (battery, motion, push, floodlight, floodlight_tasks, pir).
 	/// Threaded into every status-publishing task so each successful
 	/// publish updates the cache; read by `republish_cached_status`
 	/// on every broker ConnAck so HA recovers full state even when
@@ -237,6 +237,9 @@ pub struct CameraHandle {
 	/// no later edge has arrived, so back-to-back edges don't cut each
 	/// other short.
 	push_seq: AtomicU64,
+	/// Bumped by every push from this camera. A push's hold window only
+	/// clears `status/push` if no later push has arrived.
+	push_alarm_seq: AtomicU64,
 	/// The camera's own IP from the last session that reached the camera
 	/// directly (TCP or local discovery). A session through remote, map
 	/// or relay discovery leaves it unchanged. `None` until the first
@@ -334,6 +337,7 @@ impl CameraHandle {
 			battery_unsupported: Arc::new(AtomicBool::new(false)),
 			led_write_lock: tokio::sync::Mutex::new(()),
 			push_seq: AtomicU64::new(0),
+			push_alarm_seq: AtomicU64::new(0),
 			camera_ip: std::sync::RwLock::new(None),
 			webhook_token,
 			webhook_target: None,
@@ -569,6 +573,11 @@ impl CameraHandle {
 		&self.push_seq
 	}
 
+	/// Push counter for `status/push`; see the `push_alarm_seq` field.
+	pub fn push_alarm_seq(&self) -> &AtomicU64 {
+		&self.push_alarm_seq
+	}
+
 	/// `true` once `battery_poller` has concluded this camera has no
 	/// battery hardware and given up. Sticky for the process lifetime;
 	/// gates the poller respawn in `Self::spawn_session_tasks`.
@@ -594,6 +603,9 @@ impl CameraHandle {
 		}
 		if let Some(motion) = self.status_cache.motion() {
 			publisher.publish_motion(motion).await?;
+		}
+		if let Some(push) = self.status_cache.push() {
+			publisher.publish_push(push).await?;
 		}
 		if let Some(on) = self.status_cache.floodlight() {
 			publisher.publish_floodlight(on).await?;

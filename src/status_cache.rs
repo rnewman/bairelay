@@ -54,6 +54,7 @@ pub enum WakeSource {
 pub struct StatusCache {
 	battery_level: RwLock<Option<u8>>,
 	motion: RwLock<Option<bool>>,
+	push: RwLock<Option<bool>>,
 	floodlight: RwLock<Option<bool>>,
 	floodlight_tasks: RwLock<Option<bool>>,
 	pir: RwLock<Option<bool>>,
@@ -84,6 +85,13 @@ impl StatusCache {
 	}
 	pub fn motion(&self) -> Option<bool> {
 		*self.motion.read_recover()
+	}
+
+	pub fn set_push(&self, active: bool) {
+		*self.push.write_recover() = Some(active);
+	}
+	pub fn push(&self) -> Option<bool> {
+		*self.push.read_recover()
 	}
 
 	pub fn set_floodlight(&self, on: bool) {
@@ -239,6 +247,7 @@ mod tests {
 		let c = StatusCache::default();
 		assert_eq!(c.battery_level(), None);
 		assert_eq!(c.motion(), None);
+		assert_eq!(c.push(), None);
 		assert_eq!(c.floodlight(), None);
 		assert_eq!(c.floodlight_tasks(), None);
 		assert_eq!(c.pir(), None);
@@ -251,6 +260,7 @@ mod tests {
 		let c = StatusCache::default();
 		c.set_battery_level(72);
 		c.set_motion(true);
+		c.set_push(true);
 		c.set_floodlight(false);
 		c.set_floodlight_tasks(true);
 		c.set_pir(false);
@@ -258,6 +268,7 @@ mod tests {
 		c.set_led(true);
 		assert_eq!(c.battery_level(), Some(72));
 		assert_eq!(c.motion(), Some(true));
+		assert_eq!(c.push(), Some(true));
 		assert_eq!(c.floodlight(), Some(false));
 		assert_eq!(c.floodlight_tasks(), Some(true));
 		assert_eq!(c.pir(), Some(false));
