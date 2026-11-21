@@ -243,6 +243,11 @@ Floodlight has two aspects on separate topics:
 
 These are distinct topics. Don't conflate them.
 
+Motion likewise has a push-only sibling:
+
+- `status/motion` — any alarm active, from `MotionStatus::Start` / `Stop`, a push or a webhook wake.
+- `status/push` — the push listener's own on/off, never driven by a session or the webhook. On at each push, off once the newest push's `motion_wake_hold_secs` window ends (`CameraHandle::push_alarm_seq` keeps an older push's timer from clearing a newer one). Reset to `off` when the listener starts. Not gated on `enable_motion`.
+
 Update intervals (`battery_update`, `preview_update`, `floodlight_update`) must be ≥ 500 ms. Validation rejects shorter.
 
 ---
