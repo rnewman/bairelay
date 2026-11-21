@@ -61,6 +61,9 @@ pub enum Feature {
 	Battery,
 	Siren,
 	Pir,
+	/// Per-object AI detection sensors. `motion_class` was this fork's
+	/// name for them before upstream added its own.
+	#[serde(alias = "motion_class")]
 	Ai,
 	Doorbell,
 }
@@ -1251,6 +1254,12 @@ mod tests {
 		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/push");
 		assert_eq!(v["payload_on"], "on");
 		assert_eq!(v["payload_off"], "off");
+	}
+
+	#[test]
+	fn motion_class_feature_is_an_alias_of_ai() {
+		let f: Feature = serde_json::from_str("\"motion_class\"").unwrap();
+		assert_eq!(f, Feature::Ai);
 	}
 
 	#[test]
