@@ -327,6 +327,141 @@ pub(crate) async fn report_alarm_update(
 	}
 }
 
+/// How long a camera `Stop` waits before it's published. Woken by a
+/// push, cameras have been seen sending an `AItype` `none` alarm a
+/// millisecond ahead of the classified one, and again every few
+/// seconds while someone stays in frame; published as-is, each pair
+/// blinks HA's motion and AI sensors off for 5–90 ms. A `Start` inside
+/// the window cancels the pending `Stop`.
+const MOTION_STOP_DEBOUNCE: Duration = Duration::from_millis(500);
+
+/// Cap on the publishes when the listener exits, so a wedged broker at
+/// shutdown can't hold the session task open.
+const EXIT_PUBLISH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A camera `Stop` waiting out [`MOTION_STOP_DEBOUNCE`]: its motion
+/// and AI objects are held back, anything else is reported at once.
+#[derive(Default)]
+struct StopDebounce {
+	pending: Option<(tokio::time::Instant, AlarmUpdate)>,
+}
+
+impl StopDebounce {
+	/// Take in one update and return what to report now. A Start drops
+	/// a pending Stop. A Stop is held (a second one keeps the first's
+	/// deadline), and while one is held an update's AI objects join it.
+	fn admit(&mut self, update: AlarmUpdate) -> Option<AlarmUpdate> {
+		let deferred = |held: &mut AlarmUpdate, update: &AlarmUpdate| {
+			if update.objects.is_some() {
+				held.objects = update.objects;
+			}
+		};
+		match update.motion {
+			MotionStatus::Start(_) => {
+				self.pending = None;
+				return Some(update);
+			}
+			MotionStatus::Stop(_) => match &mut self.pending {
+				Some((_, held)) => {
+					held.motion = update.motion;
+					deferred(held, &update);
+				}
+				None => {
+					let held = AlarmUpdate {
+						motion: update.motion,
+						objects: update.objects,
+						visitor: None,
+						doorbell_press: false,
+					};
+					self.pending = Some((tokio::time::Instant::now() + MOTION_STOP_DEBOUNCE, held));
+				}
+			},
+			MotionStatus::NoChange(_) => match &mut self.pending {
+				Some((_, held)) => deferred(held, &update),
+				None => return Some(update),
+			},
+		}
+		update.doorbell_press.then(|| AlarmUpdate {
+			doorbell_press: true,
+			..AlarmUpdate::no_change(std::time::Instant::now())
+		})
+	}
+
+	fn deadline(&self) -> Option<tokio::time::Instant> {
+		self.pending.as_ref().map(|(at, _)| *at)
+	}
+
+	fn take(&mut self) -> Option<AlarmUpdate> {
+		self.pending.take().map(|(_, held)| held)
+	}
+}
+
+/// Report an update past [`StopDebounce`] and track the session's
+/// alarm: open from a reported Start, closed by a reported Stop.
+async fn report_session_update(
+	camera_name: &str,
+	publisher: &StatusPublisher<'_>,
+	status_cache: &StatusCache,
+	ai_caps: CameraCapabilitiesView,
+	report: &mut AlarmReport,
+	update: &AlarmUpdate,
+) {
+	report_alarm_update(
+		camera_name,
+		publisher,
+		status_cache,
+		ai_caps,
+		report,
+		update,
+	)
+	.await;
+	match update.motion {
+		MotionStatus::Start(_) => status_cache.set_session_alarm(true),
+		MotionStatus::Stop(_) => status_cache.set_session_alarm(false),
+		MotionStatus::NoChange(_) => {}
+	}
+}
+
+/// A Stop still waiting out its debounce, or an alarm the session
+/// opened and never closed, would be lost with the session and leave
+/// HA stuck on `on`: report the one, clear the other. Bounded, as the
+/// broker may be going away too at shutdown; the alarm is closed first
+/// so a timed-out publish can't lock the next session's fallback out.
+async fn close_session_alarm(
+	camera_name: &str,
+	publisher: &StatusPublisher<'_>,
+	status_cache: &StatusCache,
+	ai_caps: CameraCapabilitiesView,
+	report: &mut AlarmReport,
+	pending: Option<AlarmUpdate>,
+) {
+	let open = status_cache.take_session_alarm();
+	if pending.is_none() && !open {
+		return;
+	}
+	let close = async {
+		if let Some(stop) = pending {
+			report_alarm_update(camera_name, publisher, status_cache, ai_caps, report, &stop).await;
+		}
+		if open {
+			report_motion(
+				camera_name,
+				publisher,
+				status_cache,
+				&mut report.motion_on,
+				false,
+			)
+			.await;
+			reset_ai_objects(publisher, status_cache, ai_caps).await;
+		}
+	};
+	let _ = tokio::time::timeout(EXIT_PUBLISH_TIMEOUT, close).await;
+}
+
+/// Camera `Stop`s wait out a 500 ms debounce. The session's
+/// alarm ([`StatusCache::session_alarm`]) is open from a Start until
+/// its published Stop; one still open when the listener exits is
+/// cleared then, since nothing else will.
 #[allow(clippy::too_many_arguments)]
 pub async fn motion_listener(
 	camera_name: String,
@@ -358,8 +493,9 @@ pub async fn motion_listener(
 			seen_on,
 		},
 	};
+	let mut debounce = StopDebounce::default();
 
-	loop {
+	'subscribe: loop {
 		let mut motion_data = match bc_camera.listen_on_motion().await {
 			Ok(md) => md,
 			Err(e) => {
@@ -399,17 +535,32 @@ pub async fn motion_listener(
 			// release is scheduled, point it 24 h out as a placeholder
 			// — the `if release_at.is_some()` guard disables that arm,
 			// so the placeholder is never actually reached.
+			let placeholder = || tokio::time::Instant::now() + Duration::from_secs(86_400);
 			let release_at = wake_hold.release_at;
-			let release_deadline = release_at
-				.unwrap_or_else(|| tokio::time::Instant::now() + Duration::from_secs(86_400));
+			let release_deadline = release_at.unwrap_or_else(placeholder);
+			let stop_at = debounce.deadline();
+			let stop_deadline = stop_at.unwrap_or_else(placeholder);
 
 			tokio::select! {
-				_ = cancel.cancelled() => return,
+				_ = cancel.cancelled() => break 'subscribe,
 				_ = tokio::time::sleep_until(release_deadline), if release_at.is_some() => {
 					// Hold-down expired with no new event — drop the
 					// wake-lock guard so the camera becomes eligible
 					// for idle disconnect.
 					wake_hold.release();
+				}
+				_ = tokio::time::sleep_until(stop_deadline), if stop_at.is_some() => {
+					if let Some(stop) = debounce.take() {
+						report_session_update(
+							&camera_name,
+							&publisher,
+							&status_cache,
+							ai_caps,
+							&mut report,
+							&stop,
+						)
+						.await;
+					}
 				}
 				// Every update is consumed in order: `next_motion()`
 				// would coalesce a buffered Start behind a press.
@@ -420,18 +571,35 @@ pub async fn motion_listener(
 						Ok(update) => visitor_edge.apply(update),
 						Err(e) => {
 							tracing::warn!(camera = %camera_name, error = %e, "Motion listener error");
+							// Re-subscribing starts from scratch; don't
+							// drop a Stop the camera already sent. An
+							// alarm still running stays open: the
+							// re-subscribed listener sees its Stop.
+							if let Some(stop) = debounce.take() {
+								report_session_update(
+									&camera_name,
+									&publisher,
+									&status_cache,
+									ai_caps,
+									&mut report,
+									&stop,
+								)
+								.await;
+							}
 							break;
 						}
 					};
-					report_alarm_update(
-						&camera_name,
-						&publisher,
-						&status_cache,
-						ai_caps,
-						&mut report,
-						&update,
-					)
-					.await;
+					if let Some(now) = debounce.admit(update) {
+						report_session_update(
+							&camera_name,
+							&publisher,
+							&status_cache,
+							ai_caps,
+							&mut report,
+							&now,
+						)
+						.await;
+					}
 					wake_hold.apply(&update);
 				}
 			}
@@ -444,6 +612,16 @@ pub async fn motion_listener(
 			break;
 		}
 	}
+
+	close_session_alarm(
+		&camera_name,
+		&publisher,
+		&status_cache,
+		ai_caps,
+		&mut report,
+		debounce.take(),
+	)
+	.await;
 }
 
 // ── Battery Poller ───────────────────────────────────────────────────
@@ -2870,6 +3048,7 @@ mod tests {
 		rig.send(now_start(), None, false).await;
 		rig.send(now_stop(), None, false).await;
 		rig.send(now_stop(), None, false).await;
+		tokio::time::sleep(MOTION_STOP_DEBOUNCE).await;
 		rig.send(now_start(), None, false).await;
 
 		let on = ("on".to_string(), true);
@@ -2877,6 +3056,127 @@ mod tests {
 		assert_eq!(rig.rows("motion"), vec![on.clone(), off, on]);
 		assert_eq!(rig.cache.motion(), Some(true));
 		rig.stop().await;
+	}
+
+	/// A Start inside a Stop's debounce window cancels it: neither the
+	/// motion nor the AI object blinks off.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_debounces_a_stop_a_start_cancels() {
+		let rig = AlarmRig::spawn(Duration::from_secs(30));
+
+		rig.send(now_start(), objects(&[AiObject::Person]), false)
+			.await;
+		rig.send(now_stop(), objects(&[]), false).await;
+		rig.send(now_start(), objects(&[AiObject::Person]), false)
+			.await;
+		tokio::time::sleep(MOTION_STOP_DEBOUNCE * 2).await;
+
+		let on = ("on".to_string(), true);
+		let off = ("off".to_string(), true);
+		let person = |rig: &AlarmRig| -> Vec<String> {
+			rig.ai_rows()
+				.into_iter()
+				.filter(|(o, _)| o == "person")
+				.map(|(_, p)| p)
+				.collect()
+		};
+		assert_eq!(rig.rows("motion"), vec![on.clone()]);
+		// The session-start reset, then the one `on`.
+		assert_eq!(person(&rig), ["off", "on"]);
+
+		rig.send(now_stop(), objects(&[]), false).await;
+		assert_eq!(rig.rows("motion"), vec![on.clone()], "still debouncing");
+		tokio::time::sleep(MOTION_STOP_DEBOUNCE).await;
+		assert_eq!(rig.rows("motion"), vec![on, off]);
+		assert_eq!(person(&rig), ["off", "on", "off"]);
+		rig.stop().await;
+	}
+
+	/// A press isn't held back by a Stop waiting out its debounce.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_reports_a_press_during_a_pending_stop() {
+		let rig = AlarmRig::spawn(Duration::from_secs(30));
+
+		rig.send(now_start(), None, false).await;
+		rig.send(now_stop(), None, true).await;
+		assert_eq!(rig.rows("doorbell"), vec![("press".to_string(), false)]);
+		assert_eq!(rig.rows("motion"), vec![("on".to_string(), true)]);
+		tokio::time::sleep(MOTION_STOP_DEBOUNCE).await;
+		assert_eq!(
+			rig.rows("motion"),
+			vec![("on".to_string(), true), ("off".to_string(), true)]
+		);
+		rig.stop().await;
+	}
+
+	/// The session's alarm is open from a Start until its Stop is
+	/// published, past the debounce.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_tracks_the_session_alarm() {
+		let rig = AlarmRig::spawn(Duration::from_secs(30));
+
+		assert!(!rig.cache.session_alarm());
+		rig.send(now_start(), None, false).await;
+		assert!(rig.cache.session_alarm());
+		rig.send(now_stop(), None, false).await;
+		assert!(rig.cache.session_alarm(), "the Stop isn't published yet");
+		tokio::time::sleep(MOTION_STOP_DEBOUNCE).await;
+		assert!(!rig.cache.session_alarm());
+		rig.stop().await;
+	}
+
+	/// Cancel flushes a Stop still waiting out its debounce.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_cancel_flushes_a_pending_stop() {
+		let rig = AlarmRig::spawn(Duration::from_secs(30));
+
+		rig.send(now_start(), None, false).await;
+		rig.send(now_stop(), None, false).await;
+		let mock = rig.mock.clone();
+		let cache = Arc::clone(&rig.cache);
+		rig.stop().await;
+		let motion: Vec<Vec<u8>> = mock
+			.published()
+			.into_iter()
+			.filter(|(t, _, _)| t == "bairelay/cam1/status/motion")
+			.map(|(_, p, _)| p)
+			.collect();
+		assert_eq!(motion, [b"on".to_vec(), b"off".to_vec()]);
+		assert!(!cache.session_alarm());
+	}
+
+	/// An alarm still open when the session ends is cleared: nothing
+	/// else will report its end.
+	#[tokio::test(start_paused = true)]
+	async fn motion_listener_exit_clears_an_open_alarm() {
+		let rig = AlarmRig::spawn(Duration::from_secs(30));
+
+		rig.send(now_start(), objects(&[AiObject::Person]), false)
+			.await;
+		let mock = rig.mock.clone();
+		let cache = Arc::clone(&rig.cache);
+		rig.stop().await;
+		let rows: Vec<(String, Vec<u8>)> = mock
+			.published()
+			.into_iter()
+			.map(|(t, p, _)| (t, p))
+			.collect();
+		assert_eq!(
+			rows.iter()
+				.filter(|(t, _)| t == "bairelay/cam1/status/motion")
+				.map(|(_, p)| p.clone())
+				.collect::<Vec<_>>(),
+			[b"on".to_vec(), b"off".to_vec()]
+		);
+		assert_eq!(
+			rows.iter()
+				.filter(|(t, _)| t == "bairelay/cam1/status/ai/person")
+				.map(|(_, p)| p.clone())
+				.next_back(),
+			Some(b"off".to_vec())
+		);
+		assert_eq!(cache.motion(), Some(false));
+		assert!(!cache.session_alarm());
 	}
 
 	/// A repeated Start publishes nothing and keeps the lock; the hold

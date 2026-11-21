@@ -122,7 +122,9 @@ pub(crate) fn motion_edge(
 
 /// Hold the camera's wake lock for `hold` so the connect loop reaches
 /// it, then publish a fallback `status/motion=off` so motion never
-/// sticks `on` when no session follows. Bumps the camera's
+/// sticks `on` when no session follows. Once the session has reported
+/// the alarm it owns `motion` and the fallback leaves it be: the
+/// session's Stop, or its exit, clears it instead. Bumps the camera's
 /// [`CameraHandle::push_seq`]: only the newest edge's window clears
 /// motion, across push, webhook PIR and forwarded-alarm edges. For a
 /// caller that has already published `on`.
@@ -164,6 +166,13 @@ fn spawn_motion_hold(
 
 		if handle.push_seq().load(Ordering::SeqCst) != seq {
 			tracing::debug!(camera = %handle.name(), "wake motion: a later edge owns the fallback clear");
+			return;
+		}
+		// Someone still in frame past the hold: the session saw the
+		// alarm start and will publish its end, so clearing here would
+		// blank a live alarm.
+		if handle.status_cache().session_alarm() {
+			tracing::debug!(camera = %handle.name(), "wake motion: the session owns the alarm's end");
 			return;
 		}
 		let Some(publisher) = publisher else {
@@ -336,6 +345,24 @@ mod tests {
 			[b"on".to_vec(), b"on".to_vec(), b"off".to_vec()]
 		);
 		assert_eq!(h.status_cache().push(), Some(false));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn motion_hold_leaves_an_alarm_the_session_reported() {
+		// Someone still in frame when the hold ends: the session saw the
+		// alarm start, so only push clears; motion waits for the
+		// session's own Stop.
+		let h = handle();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let hold = Duration::from_secs(5);
+		h.status_cache().set_session_alarm(true);
+		push_edge(Arc::clone(&h), Some(&mqtt), "bairelay", hold, &cancel);
+		tokio::time::sleep(hold + Duration::from_secs(1)).await;
+		assert_eq!(motion_payloads(&mock), [b"on".to_vec()]);
+		assert_eq!(h.status_cache().motion(), Some(true));
+		assert_eq!(push_payloads(&mock), [b"on".to_vec(), b"off".to_vec()]);
+		assert_eq!(h.wake_lock().count(), 0, "the wake hold still ends");
 	}
 
 	#[tokio::test(start_paused = true)]

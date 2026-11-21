@@ -454,7 +454,7 @@ forward_upstream = true
 
 **Without the wake server.** The push listener doesn't need `[wake_server]` if each camera has a literal IP `address` (with a DHCP reservation, since that's what pushes are matched on). Leaving `p2p*.reolink.com` with Reolink keeps the Reolink app's remote live view working; bairelay then reaches the camera — awake from the motion that triggered the push — through its configured discovery.
 
-The "real" `motion=off` arrives once bairelay reconnects in-session and the camera reports `MotionStatus::Stop` natively. The hold-window timeout is a fallback so HA never sticks on `on`.
+The "real" `motion=off` arrives once bairelay reconnects in-session and the camera reports `MotionStatus::Stop` natively, 500 ms after the Stop unless a Start lands first (the camera can send an unclassified alarm just ahead of a classified one). The hold-window timeout is a fallback so HA never sticks on `on`; once the session has reported the alarm, the fallback leaves `motion` to it, so an alarm that outlasts the hold isn't cleared early (if the session drops instead, it clears `motion` and the AI objects on the way out).
 
 **Push vs. motion.** Each push also turns `status/push` on for the same hold window (a later push extends it), surfaced in HA as a `push` binary sensor. In-session motion never touches it, and neither does a webhook wake. `status/motion` reports every motion event a live session sees — including during live view or a kept-awake session — whereas a push is the camera's own alarm decision, made under its detection and schedule settings. Automations that should fire like a Reolink notification belong on `push`. The entity is only published while `[push_listener]` is enabled.
 
