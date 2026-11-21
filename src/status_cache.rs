@@ -28,6 +28,7 @@
 use crate::stream_source::RwLockPoisonRecover as _;
 use bairelay_mqtt::control::IrMode;
 use bairelay_neolink_core::bc_protocol::AiObjects;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -70,6 +71,11 @@ pub struct StatusCache {
 	last_doorbell_press: RwLock<Option<tokio::time::Instant>>,
 	/// The source and time of the last wake that was acted on.
 	last_wake: RwLock<Option<(WakeSource, tokio::time::Instant)>>,
+	/// `true` from the in-session motion listener's Start until its
+	/// published Stop, or until the session ends. While set the session
+	/// owns `motion` and the AI objects, and a wake edge's hold-window
+	/// fallback leaves them alone.
+	session_alarm: AtomicBool,
 }
 
 impl StatusCache {
@@ -85,6 +91,17 @@ impl StatusCache {
 	}
 	pub fn motion(&self) -> Option<bool> {
 		*self.motion.read_recover()
+	}
+
+	pub fn set_session_alarm(&self, open: bool) {
+		self.session_alarm.store(open, Ordering::SeqCst);
+	}
+	pub fn session_alarm(&self) -> bool {
+		self.session_alarm.load(Ordering::SeqCst)
+	}
+	/// Close the session's alarm, returning whether it was open.
+	pub fn take_session_alarm(&self) -> bool {
+		self.session_alarm.swap(false, Ordering::SeqCst)
 	}
 
 	pub fn set_push(&self, active: bool) {
