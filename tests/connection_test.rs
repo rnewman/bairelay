@@ -47,6 +47,7 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 
 	cam.status_cache().set_battery_level(73);
 	cam.status_cache().set_motion(true);
+	cam.status_cache().set_push(true);
 	cam.status_cache().set_floodlight(false);
 	cam.status_cache().set_floodlight_tasks(true);
 	cam.status_cache().set_pir(false);
@@ -77,6 +78,10 @@ async fn republish_cached_status_emits_each_set_field_as_retained() {
 	assert!(
 		saw("bairelay/cam1/status/motion", b"on"),
 		"motion=on retained must land"
+	);
+	assert!(
+		saw("bairelay/cam1/status/push", b"on"),
+		"push=on retained must land"
 	);
 	assert!(
 		saw("bairelay/cam1/status/floodlight", br#"{"state":"off"}"#),

@@ -29,6 +29,10 @@
 //! camera is that wake, already reported, and is dropped
 //! (`wake_events::push_edge`).
 //!
+//! Each push also drives `status/push`, which in-session motion never
+//! touches: it's the camera's own alarm decision (its detection and
+//! schedule settings), not every motion report a live session sees.
+//!
 //! **Threat model — source-IP trust.** A peer IP that resolves through
 //! the wake-server registry or a camera's address is treated as
 //! authentic; we have no further authentication on the TCP-accept itself (the camera's TLS handshake
@@ -47,7 +51,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-use bairelay_mqtt::SharedMqttClient;
+use bairelay_mqtt::{SharedMqttClient, StatusPublisher};
 use bairelay_wake_server::registry::CameraRegistry;
 
 use crate::camera::CameraHandle;
@@ -113,6 +117,12 @@ pub async fn run_with_listener(
 		motion_wake_hold_secs = cfg.motion_wake_hold.as_secs_f64(),
 		"Push listener started"
 	);
+
+	// Before the first accept, so it can't race a push. Connections
+	// meanwhile wait in the listen backlog.
+	if let Some(ref mqtt) = mqtt {
+		reset_push_state(mqtt, &topic_prefix, &cameras).await;
+	}
 
 	loop {
 		tokio::select! {
@@ -180,6 +190,33 @@ fn handle_push(
 			peer_ip = %peer_ip,
 			"Motion push from camera (treating TCP-accept as motion edge)"
 		);
+	}
+}
+
+/// Publish `status/push=off` for every camera, so a retained `on` from
+/// a run that died mid-hold doesn't linger. Bounded so a wedged broker
+/// can't keep the listener from accepting.
+async fn reset_push_state(
+	mqtt: &SharedMqttClient,
+	topic_prefix: &str,
+	cameras: &HashMap<String, Arc<CameraHandle>>,
+) {
+	let reset = async {
+		for handle in cameras.values() {
+			let publisher = StatusPublisher::new(mqtt, topic_prefix, handle.name());
+			match publisher.publish_push(false).await {
+				Ok(()) => handle.status_cache().set_push(false),
+				Err(e) => {
+					tracing::warn!(camera = %handle.name(), error = %e, "push listener: initial push=off publish failed");
+				}
+			}
+		}
+	};
+	if tokio::time::timeout(Duration::from_secs(2), reset)
+		.await
+		.is_err()
+	{
+		tracing::warn!("push listener: initial push=off publishes timed out");
 	}
 }
 
@@ -841,11 +878,64 @@ mod tests {
 		})
 		.await;
 		assert!(absorbed.is_ok(), "{}", logs.text());
-		// An absorbed edge spawns nothing, so its outcome is final here.
-		assert!(mock.published().is_empty(), "{:?}", mock.published_topics());
+		// An absorbed edge takes no hold and publishes no motion; only
+		// the listener-start reset and the push itself land.
+		assert!(
+			!mock
+				.published_topics()
+				.iter()
+				.any(|t| t == "bairelay/gate/status/motion"),
+			"{:?}",
+			mock.published_topics()
+		);
+		let push_on = poll_published(&mock, Duration::from_secs(2), |t, p| {
+			t == "bairelay/gate/status/push" && p == b"on"
+		})
+		.await;
+		assert!(push_on, "the push is still the camera's alarm");
 		assert_eq!(handle.wake_lock().count(), 0);
 		assert!(!logs.text().contains("Motion push from camera"));
 
+		cancel.cancel();
+		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
+	}
+
+	#[tokio::test]
+	async fn listener_start_resets_push_off_for_every_camera() {
+		// A retained `on` from a run that died mid-hold mustn't linger.
+		let mut cameras: HashMap<String, Arc<CameraHandle>> = HashMap::new();
+		for name in ["front", "back"] {
+			cameras.insert(name.into(), handle_with_uid(name, None));
+		}
+		let cameras = Arc::new(cameras);
+		let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let port = listener.local_addr().unwrap().port();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let cfg = RuntimeConfig {
+			bind_addr: "127.0.0.1".parse().unwrap(),
+			bind_port: port,
+			motion_wake_hold: Duration::from_secs(5),
+			stale_after: Duration::from_secs(80),
+		};
+		let server = tokio::spawn(run_with_listener(
+			listener,
+			cfg,
+			bairelay_wake_server::make_registry(),
+			Arc::clone(&cameras),
+			Some(mqtt),
+			"bairelay".into(),
+			cancel.clone(),
+		));
+		for name in ["front", "back"] {
+			let topic = format!("bairelay/{name}/status/push");
+			let reset = poll_published(&mock, Duration::from_secs(2), |t, p| {
+				t == topic && p == b"off"
+			})
+			.await;
+			assert!(reset, "{topic} reset off at listener start");
+			assert_eq!(cameras[name].status_cache().push(), Some(false));
+		}
 		cancel.cancel();
 		let _ = tokio::time::timeout(Duration::from_secs(2), server).await;
 	}

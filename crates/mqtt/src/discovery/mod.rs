@@ -51,6 +51,8 @@ pub enum Feature {
 	Floodlight,
 	Camera,
 	Motion,
+	/// Push-listener alarm edges, distinct from in-session motion.
+	Push,
 	Led,
 	Ir,
 	Reboot,
@@ -66,10 +68,11 @@ pub enum Feature {
 impl Feature {
 	/// Full set of features emitted when `[mqtt.discovery]` is
 	/// present and no explicit `features = [...]` list is supplied.
-	pub const ALL: [Feature; 13] = [
+	pub const ALL: [Feature; 14] = [
 		Feature::Floodlight,
 		Feature::Camera,
 		Feature::Motion,
+		Feature::Push,
 		Feature::Led,
 		Feature::Ir,
 		Feature::Reboot,
@@ -590,6 +593,29 @@ fn ai_ids(ctx: &DiscoveryContext, object: AiObject) -> (String, String) {
 	(unique_id, topic)
 }
 
+/// `binary_sensor` that is on while a camera push (the camera's own
+/// alarm notification, intercepted by the push listener) is within its
+/// hold window. Unlike `md`, in-session motion never drives it.
+pub fn build_push(ctx: &DiscoveryContext) -> Option<(String, Vec<u8>)> {
+	let friendly = title_case(ctx.camera_name);
+	let unique_id = unique(ctx.topic_prefix, ctx.camera_name, "push");
+	let payload = DiscoveryBinarySensor {
+		name: "Push".to_string(),
+		unique_id: unique_id.clone(),
+		device_class: None,
+		icon: Some("mdi:bell-ring".to_string()),
+		device: device_block(ctx, &friendly),
+		availability: availability_block(ctx),
+		payload_off: "off".to_string(),
+		payload_on: "on".to_string(),
+		state_topic: crate::topics::status_push(ctx.topic_prefix, ctx.camera_name),
+	};
+	Some((
+		config_topic(ctx, "binary_sensor", &unique_id),
+		to_json(&payload),
+	))
+}
+
 /// `binary_sensor` entities for the per-object AI detections. Person,
 /// vehicle and animal are emitted unless `ai` is absent; face and
 /// package additionally need `doorbell` present.
@@ -897,6 +923,7 @@ mod tests {
 				Feature::Floodlight
 				| Feature::Camera
 				| Feature::Motion
+				| Feature::Push
 				| Feature::Led
 				| Feature::Ir
 				| Feature::Reboot
@@ -912,7 +939,7 @@ mod tests {
 		for f in Feature::ALL {
 			touch(f);
 		}
-		assert_eq!(Feature::ALL.len(), 13);
+		assert_eq!(Feature::ALL.len(), 14);
 	}
 
 	#[test]
@@ -1208,6 +1235,28 @@ mod tests {
 		assert_eq!((ai, db), (Feature::Ai, Feature::Doorbell));
 		assert!(Feature::ALL.contains(&Feature::Ai));
 		assert!(Feature::ALL.contains(&Feature::Doorbell));
+	}
+
+	#[test]
+	fn push_is_a_binary_sensor_on_status_push() {
+		let f = Fixture::new("bairelay");
+		let caps = CameraCapabilitiesView::default();
+		let (topic, json) = build_push(&f.ctx(&caps)).expect("emitted");
+		assert_eq!(
+			topic,
+			"homeassistant/binary_sensor/bairelay_frontdoor_push/config"
+		);
+		let v = parse(&json);
+		assert_eq!(v["name"], "Push");
+		assert_eq!(v["state_topic"], "bairelay/frontdoor/status/push");
+		assert_eq!(v["payload_on"], "on");
+		assert_eq!(v["payload_off"], "off");
+	}
+
+	#[test]
+	fn push_feature_parses_from_snake_case() {
+		let f: Feature = serde_json::from_str("\"push\"").unwrap();
+		assert_eq!(f, Feature::Push);
 	}
 
 	#[test]

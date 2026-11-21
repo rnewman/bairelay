@@ -47,7 +47,9 @@ pub(crate) fn claim_wake(handle: &CameraHandle, source: WakeSource) -> bool {
 }
 
 /// A push-listener edge: a [`motion_edge`] unless a webhook wake
-/// already covers it. Returns whether the edge was acted on.
+/// already covers it. Returns whether the edge was acted on. Every push
+/// raises [`push_alarm`] either way: it's the camera's alarm decision,
+/// not a wake.
 pub(crate) fn push_edge(
 	handle: Arc<CameraHandle>,
 	mqtt: Option<&SharedMqttClient>,
@@ -55,11 +57,54 @@ pub(crate) fn push_edge(
 	hold: Duration,
 	cancel: &CancellationToken,
 ) -> bool {
+	push_alarm(Arc::clone(&handle), mqtt, topic_prefix, hold, cancel);
 	if !claim_wake(&handle, WakeSource::Push) {
 		return false;
 	}
 	motion_edge(handle, mqtt, topic_prefix, hold, cancel);
 	true
+}
+
+/// `status/push` for one push: on now, off once the newest push's
+/// `hold` ends ([`CameraHandle::push_alarm_seq`]). Only pushes drive
+/// it, so unlike `status/motion` it never follows in-session motion.
+/// Not gated on `enable_motion`: the push listener drives it.
+pub(crate) fn push_alarm(
+	handle: Arc<CameraHandle>,
+	mqtt: Option<&SharedMqttClient>,
+	topic_prefix: &str,
+	hold: Duration,
+	cancel: &CancellationToken,
+) {
+	let Some(mqtt) = mqtt.cloned() else {
+		return;
+	};
+	let seq = handle.push_alarm_seq().fetch_add(1, Ordering::SeqCst) + 1;
+	let prefix = topic_prefix.to_string();
+	let cancel = cancel.clone();
+	tokio::spawn(async move {
+		let publisher = StatusPublisher::new(&mqtt, &prefix, handle.name());
+		if let Err(e) = publisher.publish_push(true).await {
+			tracing::warn!(camera = %handle.name(), error = %e, "push alarm: publish_push(true) failed");
+		}
+		handle.status_cache().set_push(true);
+
+		crate::run_support::sleep_or_cancel(hold, &cancel).await;
+
+		if handle.push_alarm_seq().load(Ordering::SeqCst) != seq {
+			tracing::debug!(camera = %handle.name(), "push alarm: a later push owns the clear");
+			return;
+		}
+		match tokio::time::timeout(FALLBACK_PUBLISH_TIMEOUT, publisher.publish_push(false)).await {
+			Ok(Ok(())) => handle.status_cache().set_push(false),
+			Ok(Err(e)) => {
+				tracing::warn!(camera = %handle.name(), error = %e, "push alarm: publish_push(false) failed");
+			}
+			Err(_) => {
+				tracing::debug!(camera = %handle.name(), "push alarm: publish_push(false) timed out (likely shutdown)");
+			}
+		}
+	});
 }
 
 /// A motion edge from a sleeping camera: publish `status/motion=on`,
@@ -169,12 +214,20 @@ mod tests {
 		))
 	}
 
-	fn motion_payloads(mock: &bairelay_mqtt::test_support::MockHandle) -> Vec<Vec<u8>> {
+	fn payloads(mock: &bairelay_mqtt::test_support::MockHandle, topic: &str) -> Vec<Vec<u8>> {
 		mock.published()
 			.into_iter()
-			.filter(|(t, _, _)| t == "bairelay/cam1/status/motion")
+			.filter(|(t, _, _)| t == topic)
 			.map(|(_, p, _)| p)
 			.collect()
+	}
+
+	fn motion_payloads(mock: &bairelay_mqtt::test_support::MockHandle) -> Vec<Vec<u8>> {
+		payloads(mock, "bairelay/cam1/status/motion")
+	}
+
+	fn push_payloads(mock: &bairelay_mqtt::test_support::MockHandle) -> Vec<Vec<u8>> {
+		payloads(mock, "bairelay/cam1/status/push")
 	}
 
 	#[tokio::test(start_paused = true)]
@@ -254,9 +307,49 @@ mod tests {
 			&cancel
 		));
 		tokio::time::sleep(Duration::from_millis(10)).await;
-		assert!(mock.published().is_empty());
+		assert!(motion_payloads(&mock).is_empty());
 		assert_eq!(h.wake_lock().count(), 0);
 		assert_eq!(h.push_seq().load(Ordering::SeqCst), 0);
+		// The push itself is still the camera's alarm.
+		assert_eq!(push_payloads(&mock), [b"on".to_vec()]);
+		tokio::time::sleep(hold).await;
+		assert_eq!(push_payloads(&mock), [b"on".to_vec(), b"off".to_vec()]);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn push_alarm_follows_the_newest_push() {
+		let h = handle();
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let hold = Duration::from_secs(6);
+		push_edge(Arc::clone(&h), Some(&mqtt), "bairelay", hold, &cancel);
+		tokio::time::sleep(Duration::from_secs(4)).await;
+		// A webhook-driven motion edge doesn't touch push.
+		motion_edge(Arc::clone(&h), Some(&mqtt), "bairelay", hold, &cancel);
+		push_edge(Arc::clone(&h), Some(&mqtt), "bairelay", hold, &cancel);
+		tokio::time::sleep(Duration::from_secs(4)).await;
+		assert_eq!(push_payloads(&mock), [b"on".to_vec(), b"on".to_vec()]);
+		assert_eq!(h.status_cache().push(), Some(true));
+		tokio::time::sleep(Duration::from_secs(4)).await;
+		assert_eq!(
+			push_payloads(&mock),
+			[b"on".to_vec(), b"on".to_vec(), b"off".to_vec()]
+		);
+		assert_eq!(h.status_cache().push(), Some(false));
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn push_alarm_ignores_enable_motion() {
+		let mut cfg = minimal_camera_config("cam1");
+		cfg.mqtt.enable_motion = false;
+		let h = Arc::new(CameraHandle::new(cfg, CancellationToken::new(), None));
+		let (mqtt, mock) = bairelay_mqtt::test_support::mock_client();
+		let cancel = CancellationToken::new();
+		let hold = Duration::from_secs(5);
+		push_edge(Arc::clone(&h), Some(&mqtt), "bairelay", hold, &cancel);
+		tokio::time::sleep(hold + Duration::from_secs(1)).await;
+		assert!(motion_payloads(&mock).is_empty());
+		assert_eq!(push_payloads(&mock), [b"on".to_vec(), b"off".to_vec()]);
 	}
 
 	#[tokio::test(start_paused = true)]
